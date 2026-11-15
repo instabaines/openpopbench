@@ -1,0 +1,3 @@
+path	bench_models/DCRec
+url	https://github.com/HKUDS/DCRec.git
+commit	23382332f79351b1340033946982b4dd93ae46ae

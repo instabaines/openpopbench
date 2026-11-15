@@ -1,0 +1,3 @@
+path	bench_models/EasyTPP
+url	https://github.com/ant-research/EasyTemporalPointProcess.git
+commit	a3466985e76357b3dd235da845ec69e7a9fee0f8

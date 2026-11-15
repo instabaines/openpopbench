@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use OpenPopBench, please cite the paper and the data sources listed in the README."
+title: "OpenPopBench: A Benchmark for Diffusion Prediction in Open Populations"
+type: software
+authors:
+  - family-names: Amure
+    given-names: Ridwan
+  - family-names: Agarwal
+    given-names: Nitin
+version: 1.0.0
+license: MIT
+repository-code: "https://github.com/instabaines/openpopbench"

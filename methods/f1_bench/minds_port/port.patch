@@ -1,0 +1,153 @@
+
+--- a/minds_bench.py
++++ b/minds_bench.py
+@@ -0,0 +1,122 @@
++"""B4: MINDS (AAAI 2024, cspjiao/MINDS @ ce9fac0) on benchmark tables. Released model, loss and hyperparameters.
++
++    PYTHONPATH=../pydeps_dhg python minds_bench.py BENCH FLOORS.parquet OUTDIR DEVICE SEED [BUDGET_HOURS=8] [EPOCHS=50]
++
++Changes from the released run.py (see PORT_CHANGES.md): (1) sequential hypergraphs from TRAIN cascades only (the released
++code used all cascades, including validation and test); (2) model selection by the released micro criterion (MAP@100) on
++VALIDATION (released: on test), released patience 10, within the time budget; (3) the previous-user training mask is built on
++the GPU with identical values (released: CPU). Social graph: benchmark edges created before the validation window.
++Evaluation: the query rows of FLOORS.parquet; prefix = last 199 events (released 200-token window) + target; micro logits
++at the last prefix position; rank among the full candidate set (floors_eval.py definition).
++"""
++import json
++import os
++import sys
++import time
++import duckdb
++import numpy as np
++import pandas as pd
++import torch
++import torch.nn as nn
++
++B, FL, OUT, DEV, SEED = sys.argv[1:6]
++SEED = int(SEED); BUDGET = float(sys.argv[6]) if len(sys.argv) > 6 else 8.0; EPOCHS = int(sys.argv[7]) if len(sys.argv) > 7 else 50
++torch.cuda.set_device(torch.device(DEV)); dev = torch.device(DEV)
++sys.argv = [sys.argv[0]]
++import dhg  # noqa: E402
++import Constants  # noqa: E402
++from DataSet import DataLoader  # noqa: E402
++from HypergraphUtil import DynamicCasHypergraph  # noqa: E402
++from Module import Module  # noqa: E402
++import run as R  # noqa: E402  (released helpers: get_performance, MAE, test_epoch)
++
++torch.manual_seed(SEED); np.random.seed(SEED); import random; random.seed(SEED)
++os.makedirs(OUT, exist_ok=True)
++log = lambda s: print(f"[b4 {time.strftime('%H:%M:%S')}] {s}", flush=True)
++con = duckdb.connect(); con.execute("SET threads=32; SET memory_limit='100GB'")
++P = f"read_parquet('{B}/participants.parquet')"; cols = [r[0] for r in con.execute(f"DESCRIBE SELECT * FROM {P}").fetchall()]
++ev = con.execute(f"""SELECT e.cascade_id, e.participant_id, e.t, e."position", (CASE c.split WHEN 'train' THEN 0 WHEN 'val' THEN 1 ELSE 2 END)::TINYINT split
++                     FROM read_parquet('{B}/events.parquet') e JOIN read_parquet('{B}/cascades.parquet') c USING (cascade_id)
++                     ORDER BY e.cascade_id, e."position" """).fetchnumpy()
++pa_ = con.execute(f"SELECT coalesce(first_seen_t, 9e18)::BIGINT f{', is_crawled' if 'is_crawled' in cols else ''} FROM {P} ORDER BY participant_id").fetchnumpy()
++N = len(pa_["f"]); user_size = N + 2
++first = torch.from_numpy(pa_["f"]).to(dev); elig = torch.from_numpy(pa_["is_crawled"].astype(bool) if "is_crawled" in pa_ else np.ones(N, bool)).to(dev)
++cstart = np.searchsorted(ev["cascade_id"], np.arange(ev["cascade_id"].max() + 2)); C = len(cstart) - 1; csplit = ev["split"][cstart[:-1]]
++users = (ev["participant_id"] + 2).astype(np.int64); tsec = ev["t"].astype(np.float64)
++mk = lambda c: (users[cstart[c]:min(cstart[c + 1], cstart[c] + 500)].tolist() + [Constants.EOS], tsec[cstart[c]:min(cstart[c + 1], cstart[c] + 500)].tolist() + [Constants.EOS])
++rng = np.random.default_rng(SEED)
++tr_ids = rng.permutation(np.flatnonzero(csplit == 0)); va_ids = rng.choice(np.flatnonzero(csplit == 1), min(2000, int((csplit == 1).sum())), replace=False)
++trc = [mk(c) for c in tr_ids]; vac = [mk(c) for c in va_ids]
++train = [[x[0] for x in trc], [x[1] for x in trc], tr_ids.tolist()]; valid = [[x[0] for x in vac], [x[1] for x in vac], va_ids.tolist()]
++val_start = int(con.execute(f"SELECT min(t0) FROM read_parquet('{B}/cascades.parquet') WHERE split = 'val'").fetchone()[0])
++eg = con.execute(f"SELECT src, dst FROM read_parquet('{B}/edges.parquet') WHERE t_created < {val_start}").fetchnumpy()
++relation_graph = dhg.Graph(user_size, list(zip((eg["src"] + 2).tolist(), (eg["dst"] + 2).tolist())), device=dev)
++t_h = time.time(); EMB, STEP, LR, LAM = int(os.environ.get("EMB", 64)), int(os.environ.get("STEP_SPLIT", 8)), float(os.environ.get("LR", 1e-3)), float(os.environ.get("LAMBDA", 0.3))   # tuning check (2026-11-13); defaults = released
++hypergraph_list = DynamicCasHypergraph(train[0], train[1], user_size, dev, STEP)
++log(f"{N:,} users, train cascades {len(tr_ids):,}, val {len(va_ids):,}, social edges {len(eg['src']):,}, hypergraphs built in {time.time() - t_h:.0f} s")
++model = Module(user_size, EMB, STEP, 200, 2, dev).to(dev)
++micro_loss_func = nn.CrossEntropyLoss(reduction="sum", ignore_index=Constants.PAD)
++optimizer = torch.optim.Adam(model.parameters(), lr=LR)
++
++
++def prev_mask(seq):
++    """Identical to the released get_previous_user_mask (-inf at earlier participants and PAD), built on the GPU."""
++    Bz, L = seq.shape
++    tri = torch.tril(torch.ones(L, L, device=seq.device))
++    masked = (tri.unsqueeze(0) * seq.unsqueeze(1).float()).long()                    # [B, L, L]: users at positions <= i
++    masked = torch.cat([masked, torch.zeros(Bz, L, 1, dtype=torch.long, device=seq.device)], 2)
++    return torch.zeros(Bz, L, user_size, device=seq.device).scatter_(2, masked, float("-inf"))
++
++
++if os.environ.get("PROBE"):   # feasibility probe (probe_util.py): real training steps, then exit
++    sys.path.insert(0, os.path.join(os.environ.get("OPB_ROOT", "."), "benchmark_build")); from probe_util import probe
++    _it = {}
++    def _step(bs):
++        if bs not in _it: _it[bs] = iter(DataLoader(train, bs, load_dict=True, cuda=False))
++        try: batch = next(_it[bs])
++        except StopIteration: _it[bs] = iter(DataLoader(train, bs, load_dict=True, cuda=False)); batch = next(_it[bs])
++        tgt, tgt_timestamp, tgt_idx, tgt_len = (item.to(dev) for item in batch); gold = tgt[:, 1:]
++        pm, pmac, la, ld = model(hypergraph_list, relation_graph, tgt)
++        ml, _ = R.get_performance(micro_loss_func, (pm[:, :-1, :] + prev_mask(tgt[:, :-1])).view(-1, pm.size(-1)), gold)
++        loss = 0.7 * ml + 0.3 * R.MAE(tgt_len, pmac) + la + 0.05 * ld; optimizer.zero_grad(); loss.backward(); optimizer.step()
++    probe(_step, len(tr_ids), int(os.environ.get("BATCH", 64)), os.environ["PROBE"], method="MINDS", bench=B, users=N)
++ck = f"{OUT}/b4_seed{SEED}.pt"; best, bad, hist, t0 = -1.0, 0, [], time.time()
++for ep in range(0 if os.environ.get("SCORE_ONLY") else EPOCHS):   # SCORE_ONLY=1: score the saved checkpoint in OUT (leakage test, 2026-11-08)
++    model.train(); tot = nw = 0.0
++    for k, batch in enumerate(DataLoader(train, int(os.environ.get("BATCH", 64)), load_dict=True, cuda=False)):   # BATCH honoured in training too (2026-10-27 fix)
++        tgt, tgt_timestamp, tgt_idx, tgt_len = (item.to(dev) for item in batch); gold = tgt[:, 1:]
++        pred_micro, pred_macro, loss_adv, loss_diff = model(hypergraph_list, relation_graph, tgt)
++        micro_loss, _ = R.get_performance(micro_loss_func, (pred_micro[:, :-1, :] + prev_mask(tgt[:, :-1])).view(-1, pred_micro.size(-1)), gold)
++        loss = (1 - LAM) * micro_loss + LAM * R.MAE(tgt_len, pred_macro) + loss_adv + 0.05 * loss_diff
++        optimizer.zero_grad(); loss.backward(); optimizer.step()
++        tot += float(micro_loss.detach()); nw += float(gold.ne(Constants.PAD).sum())
++        if k % 1000 == 0: log(f"epoch {ep} batch {k:,} micro loss/word {float(micro_loss.detach()) / max(float(gold.ne(Constants.PAD).sum()), 1):.4f}")
++        if (time.time() - t0) / 3600 > BUDGET: break
++    scores, _ = R.test_epoch(model, DataLoader(valid, min(64, int(os.environ.get("BATCH", 64))), load_dict=True, cuda=False, test=True), relation_graph, hypergraph_list, user_size, dev, [10, 50, 100])
++    v = float(scores["map@100"]); hist.append(dict(epoch=ep, train_micro_loss=tot / max(nw, 1), **{k_: float(x) for k_, x in scores.items()}))
++    log(f"epoch {ep} val {hist[-1]}")
++    if v > best: best, bad = v, 0; torch.save(model.state_dict(), ck)
++    else: bad += 1
++    if bad >= 10 or (time.time() - t0) / 3600 > BUDGET: break
++model.load_state_dict(torch.load(ck, map_location=dev)); model.eval(); train_hours = (time.time() - t0) / 3600
++
++fl = pd.read_parquet(FL).sort_values("event_row").reset_index(drop=True)
++erow = con.execute(f"""SELECT cascade_id, "position" FROM read_parquet('{B}/events.parquet') ORDER BY t, cascade_id, "position" """).fetchnumpy()
++qc, qp = erow["cascade_id"][fl.event_row.values], erow["position"][fl.event_row.values]
++Rk = np.zeros(len(fl)); QB = 32; t1 = time.time()
++with torch.no_grad():
++    for b0 in range(0, len(fl), QB):
++        idx = list(range(b0, min(b0 + QB, len(fl)))); T = np.zeros((len(idx), 200), np.int64); last = []
++        for r, i in enumerate(idx):
++            s0 = cstart[qc[i]]; a = max(0, qp[i] - 199); seq = users[s0 + a:s0 + qp[i] + 1]; T[r, :len(seq)] = seq; last.append(len(seq) - 2)
++        pm, _, _, _ = model(hypergraph_list, relation_graph, torch.from_numpy(T).to(dev))
++        for r, i in enumerate(idx):
++            s0 = cstart[qc[i]]; j = s0 + qp[i]; y = int(ev["participant_id"][j]); tq = int(ev["t"][j])
++            lg = pm[r, last[r], 2:N + 2]
++            cand = elig & (first < tq); cand[torch.from_numpy(ev["participant_id"][s0:j].astype(np.int64)).to(dev)] = False; cand[y] = True
++            v = lg[y]; sc = lg[cand]; Rk[i] = 1 + float((sc > v).sum()) + 0.5 * (float((sc == v).sum()) - 1)
++        if b0 % (QB * 250) == 0: log(f"eval {b0:,}/{len(fl):,} ({time.time() - t1:.0f} s)")
++out = fl[["event_row", "cascade_id", "participant_id", "t", "split", "position", "in_all_sample", "in_novel_sample", "novel", "n_candidates"]].copy()
++out["rank_b4"] = Rk; out.to_parquet(f"{OUT}/b4_seed{SEED}.parquet", index=False)
++json.dump(dict(seed=SEED, hist=hist, train_hours=train_hours, budget_h=BUDGET), open(f"{OUT}/b4_seed{SEED}.json", "w"), indent=1)
++log("DONE")
+
+--- a/PORT_CHANGES.md
++++ b/PORT_CHANGES.md
+@@ -0,0 +1,23 @@
++# MINDS: changes from the released code (cspjiao/MINDS @ ce9fac0, AAAI 2024)
++
++## G-repro (released `run.py`, Christianity, unchanged)
++- Hits@100 0.576 at the best epoch, against the paper's 0.6250 (Table 2): −7.9% relative. **Pass.**
++- The released loop selects the epoch by test MAP@100.
++- Log: `../minds_repro_christianity.log`.
++
++## Benchmark adapter (`minds_bench.py`)
++1. **Hypergraphs from training cascades only.** The released `run.py:201` builds them from all cascades, validation and test included.
++2. **Selection on validation.** The released micro criterion (MAP@100) is computed on 2,000 validation cascades, with the released patience of 10. The released code selected on test.
++3. **Previous-user mask built on the GPU.** It is element-wise identical to the released `get_previous_user_mask`, which builds it on the CPU.
++4. **Data.**
++   - Benchmark splits; cascades truncated to their first 500 events. The released loader drops cascades longer than 500.
++   - Social graph from edges created before the validation window, as an undirected `dhg.Graph`, as released.
++5. **Dependencies.** `dhg==0.9.4` and `optuna` live in `../pydeps_dhg`. Packages the environment already has were moved to `../pydeps_dhg_shadowed`, so they do not shadow it.
++
++**2026-10-27 fix.** The final training loop hard-coded batch 64; only the probe read `BATCH`. It now uses `BATCH` (default 64, unchanged), and validation uses min(64, `BATCH`).
++- **Unaffected:** all earlier runs used the default.
++- **Affected:** the Telegram one-epoch runs, which had silently trained at 64 instead of the probed batch.
++
++**2026-11-08, `SCORE_ONLY=1` (leakage test).** Skips training and scores the checkpoint already in OUT, loaded onto DEVICE (`map_location`). Used by the leakage test (`opb leakage`) to score one checkpoint on the original and the cut world. Released results are unaffected.
++
++- **Tuning check (2026-11-13; paper, Appendix F.3).** Environment overrides of the hyperparameters listed there; when unset, every value equals the released run.

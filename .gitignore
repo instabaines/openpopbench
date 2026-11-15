@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.parquet
+*.pt
+*.pth
+*.pkl
+*.log
+*.egg-info/
+# created by scripts/setup_methods.sh, runs and builds (repository root only)
+/bench_models/
+/f1_bench/
+/f1_repro/
+/pydeps_*/
+/runs/
+/work/
+/build/

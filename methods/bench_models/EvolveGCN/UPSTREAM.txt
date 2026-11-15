@@ -1,0 +1,3 @@
+path	bench_models/EvolveGCN
+url	https://github.com/IBM/EvolveGCN.git
+commit	90869062bbc98d56935e3d92e1d9b1b4c25be593

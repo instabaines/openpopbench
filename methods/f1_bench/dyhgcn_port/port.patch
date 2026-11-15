@@ -1,0 +1,210 @@
+
+--- a/COMPAT_CHANGES.md
++++ b/COMPAT_CHANGES.md
+@@ -0,0 +1,19 @@
++# Changes from the released DyHGCN (chunyuanY/DyHGCN @ 54cd2c6)
++
++1. **torch_geometric ≥ 2 compatibility.** `GCNConv.weight` moved to `GCNConv.lin.weight`. Initialisation now uses `_gcn_w(conv)`. The model is unchanged.
++
++## G-repro (2026-10-14)
++- **What was run:** the released `run.py`, which hard-codes Memetracker and DyHGCN-H.
++- **Result:** Hits@100 0.582 (best epoch; the released loop selects on test) against the paper's 58.78% (Table 4), −1% relative. **Pass.**
++- Log: `../dyhgcn_repro_memetracker_H.log`.
++
++## Benchmark adapter (`dyhgcn_bench.py`)
++- **Variant:** DyHGCN-S, the paper's headline model, which uses the social graph.
++- **Selection:** on the validation split; the released loop selected on test.
++- **Truncation:** cascades are cut to their first 500 events. The released loader drops cascades longer than 500 entirely.
++
++## Data-pipeline bug fixes, used for the benchmark runs only (the model code is unchanged; the G-repro run used the released loader)
++
++**Training timestamps.** The released `DataConstruct.next()` reshuffles `_train_cascades` at the end of every epoch, but not `_train_cascades_timestamp`. From the second epoch on, timestamps no longer match their cascades. Both are now shuffled with the same seed.
++
++**Validation timestamps.** Released validation batches use the user-index lists as timestamps (`seq_timestamp = self._valid_cascades`). They now use `_valid_cascades_timestamp`.
+
+--- a/DataConstruct.py
++++ b/DataConstruct.py
+@@ -451,7 +451,7 @@
+                 seq_timestamp = self._train_cascades_timestamp[start_idx:end_idx]
+             elif self.data == 1:
+                 seq_insts = self._valid_cascades[start_idx:end_idx]
+-                seq_timestamp = self._valid_cascades[start_idx:end_idx]
++                seq_timestamp = self._valid_cascades_timestamp[start_idx:end_idx]   # port fix: released code used the user lists as timestamps
+             else:
+                 seq_insts = self._test_cascades[start_idx:end_idx]
+                 seq_timestamp = self._test_cascades_timestamp[start_idx:end_idx]
+@@ -461,8 +461,10 @@
+             return seq_data, seq_data_timestamp
+         else:
+ 
+-            if self._need_shuffle:
+-                random.shuffle(self._train_cascades)
++            if self._need_shuffle:   # port fix: shuffle cascades and their timestamps together (released code shuffled cascades only)
++                _seed = random.randint(0, 10**9)
++                random.seed(_seed); random.shuffle(self._train_cascades)
++                random.seed(_seed); random.shuffle(self._train_cascades_timestamp)
+                 #random.shuffle(self._test_cascades)
+ 
+             self._iter_count = 0
+
+--- a/dyhgcn_bench.py
++++ b/dyhgcn_bench.py
+@@ -0,0 +1,114 @@
++"""B3: DyHGCN-S (released code, torch_geometric compat fix only; see COMPAT_CHANGES.md) on benchmark tables.
++
++    python dyhgcn_bench.py BENCH FLOORS.parquet OUTDIR DEVICE SEED [BUDGET_HOURS=8] [EPOCHS=50]
++
++Data via benchmark_build/f1_export.py: train cascades for training and for the dynamic heterogeneous diffusion graph
++(the released loader builds it from the training file only); 2,000 validation cascades for model selection by the
++released criterion (Hits@100), here on VALIDATION (the released loop selected on test); patience 5; time budget.
++Released hyperparameters: batch 16, d_model 64, warmup 1000, dropout 0.1, Adam(0.9, 0.98).
++Evaluation: the query rows of FLOORS.parquet; prefix = last 499 events (the released 500-event cap) with the target appended;
++logits at the last input position; rank among the full candidate set (floors_eval.py definition).
++"""
++import json
++import os
++import sys
++import time
++import duckdb
++import numpy as np
++import pandas as pd
++import torch
++import torch.nn as nn
++
++B, FL, OUT, DEV, SEED = sys.argv[1:6]
++SEED = int(SEED); BUDGET = float(sys.argv[6]) if len(sys.argv) > 6 else 8.0; EPOCHS = int(sys.argv[7]) if len(sys.argv) > 7 else 50
++torch.cuda.set_device(torch.device(DEV)); dev = torch.device(DEV)
++sys.path.insert(0, os.path.join(os.environ.get("OPB_ROOT", "."), "benchmark_build"))
++from f1_export import export  # noqa: E402
++sys.argv = [sys.argv[0]]
++import Constants  # noqa: E402
++from DataConstruct import DataConstruct, LoadRelationGraph, LoadDynamicHeteGraph  # noqa: E402
++from DyHGCN import DyHGCN_S  # noqa: E402
++from Metrics import Metrics  # noqa: E402
++from Optim import ScheduledOptim  # noqa: E402
++
++torch.manual_seed(SEED); np.random.seed(SEED); import random; random.seed(SEED)
++os.makedirs(OUT, exist_ok=True)
++log = lambda s: print(f"[b3 {time.strftime('%H:%M:%S')}] {s}", flush=True)
++D = f"{OUT}/dyhgcn_data"
++if not os.path.exists(f"{D}/u2idx.pickle"): export(B, D); log("exported")
++relation_graph = LoadRelationGraph(D); diffusion_graph = LoadDynamicHeteGraph(D)
++train_data = DataConstruct(D, data=0, load_dict=True, batch_size=int(os.environ.get("BATCH", 16)), cuda=False)   # BATCH override (feasibility probe; paper, Appendix D) (released default 16)
++valid_data = DataConstruct(D, data=1, load_dict=True, batch_size=16, cuda=False, shuffle=False)
++
++
++class Opt: pass
++opt = Opt(); opt.d_model = opt.d_word_vec = 64; opt.user_size = train_data.user_size
++model = DyHGCN_S(opt).to(dev)
++loss_func = nn.CrossEntropyLoss(reduction="sum", ignore_index=Constants.PAD).to(dev)
++optimizer = ScheduledOptim(torch.optim.Adam(model.parameters(), betas=(0.9, 0.98), eps=1e-09), opt.d_model, 1000)
++metric = Metrics(); log(f"user_size {opt.user_size:,}, train cascades {train_data.train_size:,}, val {valid_data.valid_size:,}, snapshots {len(diffusion_graph)}")
++
++
++def val_hits100():
++    model.eval(); s = n = 0.0
++    with torch.no_grad():
++        for tgt, ts_ in valid_data:
++            y = tgt[:, 1:].contiguous().view(-1).numpy()
++            pred = model(tgt.to(dev), ts_.to(dev), relation_graph, diffusion_graph).cpu().numpy()
++            sb, ln = metric.compute_metric(pred, y, [100]); s += sb["hits@100"] * ln; n += ln
++    model.train(); return s / n
++
++
++if os.environ.get("PROBE"):   # feasibility probe (probe_util.py): real training steps, then exit
++    sys.path.insert(0, os.path.join(os.environ.get("OPB_ROOT", "."), "benchmark_build")); from probe_util import probe
++    _it = {}
++    def _step(bs):
++        if bs not in _it: _it[bs] = iter(DataConstruct(D, data=0, load_dict=True, batch_size=bs, cuda=False))
++        try: tgt, ts_ = next(_it[bs])
++        except StopIteration: _it[bs] = iter(DataConstruct(D, data=0, load_dict=True, batch_size=bs, cuda=False)); tgt, ts_ = next(_it[bs])
++        tgt, ts_ = tgt.to(dev), ts_.to(dev); optimizer.zero_grad()
++        loss = loss_func(model(tgt, ts_, relation_graph, diffusion_graph), tgt[:, 1:].contiguous().view(-1)); loss.backward(); optimizer.step()
++    probe(_step, train_data.train_size, int(os.environ.get("BATCH", 16)), os.environ["PROBE"], method="DyHGCN-S", bench=B, users=opt.user_size)
++ck = f"{OUT}/b3_seed{SEED}.pt"; best, bad, hist, t0 = -1.0, 0, [], time.time()
++for ep in range(EPOCHS):
++    model.train(); tot = nw = 0.0
++    for k, (tgt, ts_) in enumerate(train_data):
++        tgt, ts_ = tgt.to(dev), ts_.to(dev); gold = tgt[:, 1:]; optimizer.zero_grad()
++        pred = model(tgt, ts_, relation_graph, diffusion_graph)
++        loss = loss_func(pred, gold.contiguous().view(-1)); loss.backward(); optimizer.step(); optimizer.update_learning_rate()
++        tot += float(loss.detach()); nw += float(gold.ne(Constants.PAD).sum())
++        if k % 2000 == 0: log(f"epoch {ep} batch {k:,} loss/word {float(loss.detach()) / max(float(gold.ne(Constants.PAD).sum()), 1):.4f}")
++        if (time.time() - t0) / 3600 > BUDGET: break
++    v = val_hits100(); hist.append(dict(epoch=ep, train_loss=tot / max(nw, 1), val_hits100=v)); log(f"epoch {ep} val hits@100 {v:.4f}")
++    if v > best: best, bad = v, 0; torch.save(model.state_dict(), ck)
++    else: bad += 1
++    if bad >= 5 or (time.time() - t0) / 3600 > BUDGET: break
++model.load_state_dict(torch.load(ck)); model.eval(); train_hours = (time.time() - t0) / 3600
++
++con = duckdb.connect(); con.execute("SET threads=32; SET memory_limit='100GB'")
++P = f"read_parquet('{B}/participants.parquet')"; cols = [r[0] for r in con.execute(f"DESCRIBE SELECT * FROM {P}").fetchall()]
++ev = con.execute(f"""SELECT cascade_id, participant_id, t, "position" FROM read_parquet('{B}/events.parquet') ORDER BY cascade_id, "position" """).fetchnumpy()
++pa_ = con.execute(f"SELECT coalesce(first_seen_t, 9e18)::BIGINT f{', is_crawled' if 'is_crawled' in cols else ''} FROM {P} ORDER BY participant_id").fetchnumpy()
++N = len(pa_["f"]); first = torch.from_numpy(pa_["f"]).to(dev); elig = torch.from_numpy(pa_["is_crawled"].astype(bool) if "is_crawled" in pa_ else np.ones(N, bool)).to(dev)
++cstart = np.searchsorted(ev["cascade_id"], np.arange(ev["cascade_id"].max() + 2)); users = ev["participant_id"] + 2
++fl = pd.read_parquet(FL).sort_values("event_row").reset_index(drop=True)
++erow = con.execute(f"""SELECT cascade_id, "position" FROM read_parquet('{B}/events.parquet') ORDER BY t, cascade_id, "position" """).fetchnumpy()
++qc, qp = erow["cascade_id"][fl.event_row.values], erow["position"][fl.event_row.values]
++R = np.zeros(len(fl)); QB = 8; t1 = time.time()
++with torch.no_grad():
++    for b0 in range(0, len(fl), QB):
++        idx = list(range(b0, min(b0 + QB, len(fl))))
++        seqs = [(cstart[qc[i]] + max(0, qp[i] - 499), cstart[qc[i]] + qp[i] + 1) for i in idx]
++        L = max(e - s for s, e in seqs); T = np.zeros((len(idx), L), np.int64); TS = np.zeros((len(idx), L), np.int64)
++        for r, (s, e) in enumerate(seqs): T[r, :e - s] = users[s:e]; TS[r, :e - s] = ev["t"][s:e]
++        pred = model(torch.from_numpy(T).to(dev), torch.from_numpy(TS).to(dev), relation_graph, diffusion_graph).view(len(idx), L - 1, -1)
++        for r, i in enumerate(idx):
++            s0 = cstart[qc[i]]; j = s0 + qp[i]; y = int(ev["participant_id"][j]); tq = int(ev["t"][j])
++            lg = pred[r, seqs[r][1] - seqs[r][0] - 2, 2:N + 2]
++            cand = elig & (first < tq); cand[torch.from_numpy(ev["participant_id"][s0:j].astype(np.int64)).to(dev)] = False; cand[y] = True
++            v = lg[y]; sc = lg[cand]; R[i] = 1 + float((sc > v).sum()) + 0.5 * (float((sc == v).sum()) - 1)
++        if b0 % (QB * 1000) == 0: log(f"eval {b0:,}/{len(fl):,} ({time.time() - t1:.0f} s)")
++out = fl[["event_row", "cascade_id", "participant_id", "t", "split", "position", "in_all_sample", "in_novel_sample", "novel", "n_candidates"]].copy()
++out["rank_b3"] = R; out.to_parquet(f"{OUT}/b3_seed{SEED}.parquet", index=False)
++json.dump(dict(seed=SEED, hist=hist, train_hours=train_hours, budget_h=BUDGET), open(f"{OUT}/b3_seed{SEED}.json", "w"), indent=1)
++log("DONE")
+
+--- a/DyHGCN.py
++++ b/DyHGCN.py
+@@ -2,6 +2,8 @@
+ import numpy as np
+ import time 
+ import torch
++# torch_geometric >= 2 compatibility (GCNConv.weight -> GCNConv.lin.weight); no change to the model
++_gcn_w = lambda conv: conv.weight if hasattr(conv, 'weight') and not hasattr(conv, 'lin') else conv.lin.weight
+ from torch.nn.parameter import Parameter
+ import torch.nn as nn
+ import math
+@@ -33,8 +35,8 @@
+ 
+     def init_weights(self):
+         init.xavier_normal_(self.embedding.weight)
+-        init.xavier_normal_(self.gnn1.weight)
+-        init.xavier_normal_(self.gnn2.weight)
++        init.xavier_normal_(_gcn_w(self.gnn1))
++        init.xavier_normal_(_gcn_w(self.gnn2))
+ 
+     def forward(self, graph):
+         graph_edge_index = graph.edge_index.cuda()
+
+--- a/HGCN.py
++++ b/HGCN.py
+@@ -1,4 +1,6 @@
+ import torch
++# torch_geometric >= 2 compatibility (GCNConv.weight -> GCNConv.lin.weight); no change to the model
++_gcn_w = lambda conv: conv.weight if hasattr(conv, 'weight') and not hasattr(conv, 'lin') else conv.lin.weight
+ import torch.nn as nn
+ # from ..inits import glorot, zeros
+ import torch.nn.init as init
+@@ -23,8 +25,8 @@
+ 
+     def init_weights(self):
+         init.xavier_normal_(self.embedding.weight)
+-        init.xavier_normal_(self.gnn1.weight)
+-        init.xavier_normal_(self.gnn2.weight)
++        init.xavier_normal_(_gcn_w(self.gnn1))
++        init.xavier_normal_(_gcn_w(self.gnn2))
+ 
+     def forward(self, graph):
+         graph_edge_index = graph.edge_index.cuda()

@@ -1,0 +1,5 @@
+path	f1_bench/minds_port
+url	https://github.com/cspjiao/MINDS.git
+commit	ce9fac043fdfecfb719d3d14ee67f22f3e8dabb5
+archive	MINDS.zip
+subdir	MINDS

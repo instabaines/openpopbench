@@ -1,0 +1,145 @@
+diff --git a/main.py b/main.py
+index 96609ef..975fa2a 100644
+--- a/main.py
++++ b/main.py
+@@ -31,16 +31,16 @@ args = parser.parse_args()
+ if not os.path.isdir(args.dataset + '_' + args.train_dir):
+     os.makedirs(args.dataset + '_' + args.train_dir)
+ with open(os.path.join(args.dataset + '_' + args.train_dir, 'args.txt'), 'w') as f:
+-    f.write('\n'.join([str(k) + ',' + str(v) for k, v in sorted(vars(args).items(), key=lambda x: x[0])]))
++    f.write('\n'.join([str(k) + ',' + str(v) for k, v in sorted(list(vars(args).items()), key=lambda x: x[0])]))
+ f.close()
+ 
+ dataset = data_partition(args.dataset)
+ [user_train, user_valid, user_test, usernum, itemnum] = dataset
+-num_batch = len(user_train) / args.batch_size
++num_batch = len(user_train) // args.batch_size   # py2 integer-division semantics preserved
+ cc = 0.0
+ for u in user_train:
+     cc += len(user_train[u])
+-print 'average sequence length: %.2f' % (cc / len(user_train))
++print('average sequence length: %.2f' % (cc / len(user_train)))
+ 
+ f = open(os.path.join(args.dataset + '_' + args.train_dir, 'log.txt'), 'w')
+ config = tf.ConfigProto()
+@@ -58,7 +58,7 @@ t0 = time.time()
+ try:
+     for epoch in range(1, args.num_epochs + 1):
+ 
+-        for step in tqdm(range(num_batch), total=num_batch, ncols=70, leave=False, unit='b'):
++        for step in tqdm(list(range(num_batch)), total=num_batch, ncols=70, leave=False, unit='b'):
+             u, seq, pos, neg = sampler.next_batch()
+             auc, loss, _ = sess.run([model.auc, model.loss, model.train_op],
+                                     {model.u: u, model.input_seq: seq, model.pos: pos, model.neg: neg,
+@@ -67,12 +67,12 @@ try:
+         if epoch % 20 == 0:
+             t1 = time.time() - t0
+             T += t1
+-            print 'Evaluating',
++            print('Evaluating', end=' ')
+             t_test = evaluate(model, dataset, args, sess)
+             t_valid = evaluate_valid(model, dataset, args, sess)
+-            print ''
+-            print 'epoch:%d, time: %f(s), valid (NDCG@10: %.4f, HR@10: %.4f), test (NDCG@10: %.4f, HR@10: %.4f)' % (
+-            epoch, T, t_valid[0], t_valid[1], t_test[0], t_test[1])
++            print('')
++            print('epoch:%d, time: %f(s), valid (NDCG@10: %.4f, HR@10: %.4f), test (NDCG@10: %.4f, HR@10: %.4f)' % (
++            epoch, T, t_valid[0], t_valid[1], t_test[0], t_test[1]))
+ 
+             f.write(str(t_valid) + ' ' + str(t_test) + '\n')
+             f.flush()
+diff --git a/model.py b/model.py
+index f21a5c3..4040cfd 100644
+--- a/model.py
++++ b/model.py
+@@ -78,6 +78,10 @@ class Model():
+         self.test_logits = tf.matmul(seq_emb, tf.transpose(test_item_emb))
+         self.test_logits = tf.reshape(self.test_logits, [tf.shape(self.input_seq)[0], args.maxlen, 101])
+         self.test_logits = self.test_logits[:, -1, :]
++        # BENCH evaluation hook (no effect on training): last-position sequence representation and the item table,
++        # so the benchmark can score the FULL candidate set instead of the released 101-item sampled evaluation
++        self.bench_last_seq = self.seq[:, -1, :]
++        self.bench_item_table = item_emb_table
+ 
+         # prediction layer
+         self.pos_logits = tf.reduce_sum(pos_emb * seq_emb, -1)
+diff --git a/modules.py b/modules.py
+index 70ab365..45ad2bc 100644
+--- a/modules.py
++++ b/modules.py
+@@ -6,14 +6,14 @@ kbpark.linguist@gmail.com.
+ https://www.github.com/kyubyong/transformer
+ '''
+ 
+-from __future__ import print_function
++
+ import tensorflow as tf
+ import numpy as np
+ 
+ 
+ def positional_encoding(dim, sentence_length, dtype=tf.float32):
+ 
+-    encoded_vec = np.array([pos/np.power(10000, 2*i/dim) for pos in range(sentence_length) for i in range(dim)])
++    encoded_vec = np.array([pos/np.power(10000, 2*i//dim) for pos in range(sentence_length) for i in range(dim)])
+     encoded_vec[::2] = np.sin(encoded_vec[::2])
+     encoded_vec[1::2] = np.cos(encoded_vec[1::2])
+ 
+diff --git a/sampler.py b/sampler.py
+index b02bd1e..70be19a 100644
+--- a/sampler.py
++++ b/sampler.py
+@@ -38,7 +38,7 @@ def sample_function(user_train, usernum, itemnum, batch_size, maxlen, result_que
+         for i in range(batch_size):
+             one_batch.append(sample())
+ 
+-        result_queue.put(zip(*one_batch))
++        result_queue.put(list(zip(*one_batch)))
+ 
+ 
+ class WarpSampler(object):
+diff --git a/util.py b/util.py
+index 4c9c8d3..d76932f 100644
+--- a/util.py
++++ b/util.py
+@@ -45,9 +45,9 @@ def evaluate(model, dataset, args, sess):
+     valid_user = 0.0
+ 
+     if usernum>10000:
+-        users = random.sample(xrange(1, usernum + 1), 10000)
++        users = random.sample(range(1, usernum + 1), 10000)
+     else:
+-        users = xrange(1, usernum + 1)
++        users = range(1, usernum + 1)
+     for u in users:
+ 
+         if len(train[u]) < 1 or len(test[u]) < 1: continue
+@@ -79,7 +79,7 @@ def evaluate(model, dataset, args, sess):
+             NDCG += 1 / np.log2(rank + 2)
+             HT += 1
+         if valid_user % 100 == 0:
+-            print '.',
++            print('.', end=' ')
+             sys.stdout.flush()
+ 
+     return NDCG / valid_user, HT / valid_user
+@@ -92,9 +92,9 @@ def evaluate_valid(model, dataset, args, sess):
+     valid_user = 0.0
+     HT = 0.0
+     if usernum>10000:
+-        users = random.sample(xrange(1, usernum + 1), 10000)
++        users = random.sample(range(1, usernum + 1), 10000)
+     else:
+-        users = xrange(1, usernum + 1)
++        users = range(1, usernum + 1)
+     for u in users:
+         if len(train[u]) < 1 or len(valid[u]) < 1: continue
+ 
+@@ -124,7 +124,7 @@ def evaluate_valid(model, dataset, args, sess):
+             NDCG += 1 / np.log2(rank + 2)
+             HT += 1
+         if valid_user % 100 == 0:
+-            print '.',
++            print('.', end=' ')
+             sys.stdout.flush()
+ 
+     return NDCG / valid_user, HT / valid_user

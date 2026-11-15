@@ -1,0 +1,3 @@
+path	bench_models/TNCN
+url	https://github.com/GraphPKU/TNCN.git
+commit	4c93a2a6c67c4033bab50a2c0a6833cbf8f24b5b

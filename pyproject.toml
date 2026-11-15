@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openpopbench"
+version = "1.0.0"
+description = "Training and evaluation harness and continuous benchmark for diffusion prediction in open populations"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = ["numpy", "pandas", "pyarrow", "scikit-learn", "duckdb", "scipy"]
+
+[project.urls]
+Homepage = "https://github.com/instabaines/openpopbench"
+
+[project.scripts]
+opb = "openpopbench.cli:main"
+
+[tool.setuptools]
+packages = ["openpopbench", "openpopbench.tests"]

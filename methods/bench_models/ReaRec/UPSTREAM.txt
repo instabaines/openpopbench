@@ -1,0 +1,3 @@
+path	bench_models/ReaRec
+url	https://github.com/TangJiakai/ReaRec.git
+commit	7f46432cba8435ae15fc744c53715024c3b2d32c

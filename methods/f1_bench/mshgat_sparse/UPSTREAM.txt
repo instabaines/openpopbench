@@ -1,0 +1,3 @@
+path	f1_bench/mshgat_sparse
+url	https://github.com/slingling/MS-HGAT
+commit	825b5c250da1f5c135284e2a59438499991f433c

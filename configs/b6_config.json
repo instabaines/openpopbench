@@ -1,0 +1,28 @@
+{
+ "results": [
+  {
+   "cfg": {
+    "hidden": -1,
+    "lr": 0.01,
+    "neg": "full"
+   },
+   "val_sel": 0.05430686229271808,
+   "val_hits100_all": 0.44775
+  },
+  {
+   "cfg": {
+    "hidden": -1,
+    "lr": 0.001,
+    "neg": "full"
+   },
+   "val_sel": 0.02477090205101468,
+   "val_hits100_all": 0.2694
+  }
+ ],
+ "best": {
+  "hidden": -1,
+  "lr": 0.01,
+  "neg": "full"
+ },
+ "rule": "max mean val MRR over all and novel slices"
+}

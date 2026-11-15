@@ -1,0 +1,3 @@
+path	bench_models/MIM
+url	https://github.com/CZ-TAO12/MIM.git
+commit	e075dd5931f5e092c13d420bf8125fcf4d7958cf

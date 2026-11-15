@@ -1,0 +1,3 @@
+path	bench_models/FEARec
+url	https://github.com/sudaada/FEARec.git
+commit	5e98f454bc885f775618b3a463eec008afeb9eb3

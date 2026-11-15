@@ -1,0 +1,46 @@
+{
+ "results": [
+  {
+   "cfg": {
+    "hidden": 0,
+    "lr": 0.01,
+    "neg": "full"
+   },
+   "val_sel": 0.07608947113931526,
+   "val_hits100_all": 0.534
+  },
+  {
+   "cfg": {
+    "hidden": 0,
+    "lr": 0.001,
+    "neg": "full"
+   },
+   "val_sel": 0.05118998251708203,
+   "val_hits100_all": 0.4091
+  },
+  {
+   "cfg": {
+    "hidden": 32,
+    "lr": 0.01,
+    "neg": "full"
+   },
+   "val_sel": 0.10289176786704769,
+   "val_hits100_all": 0.64405
+  },
+  {
+   "cfg": {
+    "hidden": 32,
+    "lr": 0.001,
+    "neg": "full"
+   },
+   "val_sel": 0.08317394910816925,
+   "val_hits100_all": 0.5828
+  }
+ ],
+ "best": {
+  "hidden": 32,
+  "lr": 0.01,
+  "neg": "full"
+ },
+ "rule": "max mean val MRR over all and novel slices"
+}

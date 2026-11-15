@@ -1,0 +1,2 @@
+Unmodified copy of the released code at commit 90869062bbc98d56935e3d92e1d9b1b4c25be593 (code files only; data/ omitted), redistributed under its Apache License 2.0; the original repository github.com/IBM/EvolveGCN is no longer public.
+Our changes are in ../changes.patch and ../new_files/, applied by scripts/setup_methods.sh.

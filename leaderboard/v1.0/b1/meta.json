@@ -1,0 +1,14 @@
+{
+ "name": "Learned feature ranker",
+ "family": "feature_ranker",
+ "code": "https://github.com/instabaines/openpopbench",
+ "queries": "full",
+ "heuristic_inputs": [
+  "popularity",
+  "recency",
+  "affinity",
+  "exposure"
+ ],
+ "training": "OpenPopBench v1.0 protocol: released hyperparameters, validation checkpoint selection, 8 GPU-h per seed on comparison tiers, 24 GPU-h on scale tiers",
+ "track": "verified"
+}

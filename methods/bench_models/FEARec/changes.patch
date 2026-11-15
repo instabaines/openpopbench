@@ -1,0 +1,9 @@
+diff --git a/recbole/model/sequential_recommender/__init__.py b/recbole/model/sequential_recommender/__init__.py
+index cc28789..731558e 100644
+--- a/recbole/model/sequential_recommender/__init__.py
++++ b/recbole/model/sequential_recommender/__init__.py
+@@ -1,2 +1,2 @@
+-from recbole.model.sequential_recommender.cl4srec import CL4SRec
++# from recbole.model.sequential_recommender.cl4srec import CL4SRec   # BENCH: cl4srec.py is not in the release; FEARec does not use it
+ from recbole.model.sequential_recommender.fearec import FEARec
+\ No newline at end of file

@@ -1,0 +1,319 @@
+
+--- a/HGAT.py
++++ b/HGAT.py
+@@ -11,6 +11,9 @@
+ from torch import nn
+ import torch.nn.functional as F
+ from layer import HGATLayer
++import os
++from sparse_ops import SparseHGATLayer
++SPARSE = os.environ.get('MSHGAT_SPARSE', '0') == '1'
+ from torch_geometric.nn import GCNConv
+ import torch.nn.init as init
+ import Constants
+@@ -105,7 +108,7 @@
+         self.is_norm = is_norm
+         if self.is_norm:
+             self.batch_norm1 = torch.nn.BatchNorm1d(output_size)
+-        self.gat1 = HGATLayer(input_size, output_size, dropout=self.dropout, transfer=False, concat=True, edge=True)
++        self.gat1 = (SparseHGATLayer if SPARSE else HGATLayer)(input_size, output_size, dropout=self.dropout, transfer=False, concat=True, edge=True)
+         self.fus1 = Fusion(output_size)
+ 
+     def forward(self, x, hypergraph_list):
+@@ -225,7 +228,7 @@
+ 
+         # conbine users and cascades
+         output_u = self.linear2(att_out.cuda())  # (bsz, user_len, |U|)
+-        mask = get_previous_user_mask(input.cpu(), self.n_node)
++        mask = get_previous_user_mask(input, self.n_node)   # port: same mask, built on the GPU (released code built it on CPU)
+ 
+         return (output_u + mask).view(-1, output_u.size(-1)).cuda()
+ 
+
+--- a/mshgat_bench.py
++++ b/mshgat_bench.py
+@@ -0,0 +1,138 @@
++"""B2: MS-HGAT (exact sparse port, see sparse_ops.py / test_equiv.py) on benchmark tables (paper, Appendix C).
++
++    MSHGAT_SPARSE=1 python mshgat_bench.py BENCH FLOORS.parquet OUTDIR DEVICE SEED [BUDGET_HOURS=20] [EPOCHS=50]
++
++Data: users = participant_id + 2 (PAD 0, EOS 1); one cascade = origin then participants, first 500 events, EOS appended
++(as the released loader). Diffusion hypergraphs from TRAIN-split cascades only (the leak-free variant; validation and test
++hyperedges are blank). Social graph: benchmark edges created before the validation window starts (time-respecting for every
++validation/test query), static as in the released code. Training: released loss, optimizer and schedule; model selection
++by the released criterion (sum of Hits@{10,50,100} and MAP@{10,50,100}) computed on the VALIDATION split (the released
++code selected on test), patience 5, within the time budget.
++Evaluation: the query rows of FLOORS.parquet. The prefix (last 199 events if longer, as the released 200-token window) is fed with
++the target appended; the logits at the last input position are the released next-user scores. Rank of the target among the
++full candidate set (floors_eval.py definition).
++"""
++import json
++import os
++import sys
++import time
++import duckdb
++import numpy as np
++import pandas as pd
++import torch
++import torch.nn as nn
++from torch_geometric.data import Data
++
++B, FL, OUT, DEV, SEED = sys.argv[1:6]
++SEED = int(SEED); BUDGET = float(sys.argv[6]) if len(sys.argv) > 6 else 20.0; EPOCHS = int(sys.argv[7]) if len(sys.argv) > 7 else 50
++torch.cuda.set_device(torch.device(DEV)); dev = torch.device(DEV)
++sys.argv = [sys.argv[0]]
++import Constants  # noqa: E402
++from HGAT import MSHGAT  # noqa: E402
++from Metrics import Metrics  # noqa: E402
++from Optim import ScheduledOptim  # noqa: E402
++from sparse_ops import ConHyperGraphListSparse  # noqa: E402
++from dataLoader import DataLoader  # noqa: E402
++
++torch.manual_seed(SEED); np.random.seed(SEED); os.makedirs(OUT, exist_ok=True)
++log = lambda s: print(f"[b2 {time.strftime('%H:%M:%S')}] {s}", flush=True)
++con = duckdb.connect(); con.execute("SET threads=32; SET memory_limit='200GB'")
++P = f"read_parquet('{B}/participants.parquet')"
++cols = [r[0] for r in con.execute(f"DESCRIBE SELECT * FROM {P}").fetchall()]
++ev = con.execute(f"""SELECT e.cascade_id, e.participant_id, e.t, e."position", (CASE c.split WHEN 'train' THEN 0 WHEN 'val' THEN 1 ELSE 2 END)::TINYINT split
++                     FROM read_parquet('{B}/events.parquet') e JOIN read_parquet('{B}/cascades.parquet') c USING (cascade_id)
++                     ORDER BY e.cascade_id, e."position" """).fetchnumpy()
++pa_ = con.execute(f"SELECT coalesce(first_seen_t, 9e18)::BIGINT f{', is_crawled' if 'is_crawled' in cols else ''} FROM {P} ORDER BY participant_id").fetchnumpy()
++N = len(pa_["f"]); user_size = N + 2
++first = torch.from_numpy(pa_["f"]).to(dev); elig = torch.from_numpy(pa_["is_crawled"].astype(bool) if "is_crawled" in pa_ else np.ones(N, bool)).to(dev)
++cstart = np.searchsorted(ev["cascade_id"], np.arange(ev["cascade_id"].max() + 2)); C = len(cstart) - 1
++csplit = ev["split"][cstart[:-1]]
++users = (ev["participant_id"] + 2).astype(np.int64); tsec = ev["t"].astype(np.float64)
++cas = [users[cstart[c]:min(cstart[c + 1], cstart[c] + 500)].tolist() + [Constants.EOS] for c in range(C)]
++tms = [tsec[cstart[c]:min(cstart[c + 1], cstart[c] + 500)].tolist() + [Constants.EOS] for c in range(C)]
++val_start = int(con.execute(f"SELECT min(t0) FROM read_parquet('{B}/cascades.parquet') WHERE split = 'val'").fetchone()[0])
++eg = con.execute(f"SELECT src, dst FROM read_parquet('{B}/edges.parquet') WHERE t_created < {val_start}").fetchnumpy()
++graph = Data(edge_index=torch.from_numpy(np.stack([eg["src"] + 2, eg["dst"] + 2]).astype(np.int64)), edge_attr=torch.ones(len(eg["src"])))
++tr_ids = np.flatnonzero(csplit == 0); va_ids = np.flatnonzero(csplit == 1)
++tr_set = set(tr_ids.tolist())
++hc = [c if i in tr_set else [Constants.EOS] for i, c in enumerate(cas)]; ht = [t if i in tr_set else [Constants.EOS] for i, t in enumerate(tms)]
++hyper = ConHyperGraphListSparse(hc, ht, user_size)
++log(f"{N:,} users, {C:,} cascades (train {len(tr_ids):,}), {len(eg['src']):,} social edges, {len(hyper[0])} hypergraph slices")
++
++rng = np.random.default_rng(SEED); tr_shuf = rng.permutation(tr_ids)
++train = [[cas[i] for i in tr_shuf], [tms[i] for i in tr_shuf], tr_shuf.tolist()]
++va_s = rng.choice(va_ids, min(2000, len(va_ids)), replace=False)
++valid = [[cas[i] for i in va_s], [tms[i] for i in va_s], va_s.tolist()]
++
++
++class Opt: pass
++opt = Opt(); opt.d_model = opt.d_word_vec = 64; opt.initialFeatureSize = 64; opt.user_size = user_size; opt.n_warmup_steps = 1000
++model = MSHGAT(opt, dropout=0.3).to(dev)
++loss_func = nn.CrossEntropyLoss(reduction="sum", ignore_index=Constants.PAD).to(dev)
++optimizer = ScheduledOptim(torch.optim.Adam(model.parameters(), betas=(0.9, 0.98), eps=1e-09), opt.d_model, opt.n_warmup_steps)
++metric = Metrics()
++
++
++def val_score():
++    model.eval(); s, n = {}, 0
++    with torch.no_grad():
++        for tgt, ts_, idx in DataLoader(valid, batch_size=64, cuda=False, test=True):
++            y = tgt[:, 1:].contiguous().view(-1).numpy()
++            pred = model(tgt.to(dev), ts_.to(dev), idx.to(dev), graph, hyper).cpu().numpy()
++            sb, ln = metric.compute_metric(pred, y, [10, 50, 100]); n += ln
++            for k, v in sb.items(): s[k] = s.get(k, 0) + v * ln
++    model.train(); return {k: v / n for k, v in s.items()}
++
++
++if os.environ.get("PROBE"):   # feasibility probe (probe_util.py): real training steps, then exit
++    sys.path.insert(0, os.path.join(os.environ.get("OPB_ROOT", "."), "benchmark_build")); from probe_util import probe
++    _it = {}
++    def _step(bs):
++        if bs not in _it: _it[bs] = iter(DataLoader(train, batch_size=bs, cuda=False))
++        try: tgt, ts_, idx = next(_it[bs])
++        except StopIteration: _it[bs] = iter(DataLoader(train, batch_size=bs, cuda=False)); tgt, ts_, idx = next(_it[bs])
++        tgt, ts_, idx = tgt.to(dev), ts_.to(dev), idx.to(dev); optimizer.zero_grad()
++        loss = loss_func(model(tgt, ts_, idx, graph, hyper), tgt[:, 1:].contiguous().view(-1)); loss.backward(); optimizer.step()
++    probe(_step, len(tr_ids), int(os.environ.get("BATCH", 64)), os.environ["PROBE"], method="MS-HGAT", bench=B, users=N)
++ck = f"{OUT}/b2_seed{SEED}.pt"; best, bad, hist, t0 = -1.0, 0, [], time.time()
++for ep in range(EPOCHS):
++    model.train(); tot = nw = 0.0
++    for k, (tgt, ts_, idx) in enumerate(DataLoader(train, batch_size=int(os.environ.get("BATCH", 64)), cuda=False)):   # BATCH override (feasibility probe; paper, Appendix D) (released default 64)
++        tgt, ts_, idx = tgt.to(dev), ts_.to(dev), idx.to(dev)
++        gold = tgt[:, 1:]; optimizer.zero_grad()
++        pred = model(tgt, ts_, idx, graph, hyper)
++        loss = loss_func(pred, gold.contiguous().view(-1)); loss.backward(); optimizer.step(); optimizer.update_learning_rate()
++        tot += float(loss.detach()); nw += float(gold.ne(Constants.PAD).sum())
++        if k % 500 == 0: log(f"epoch {ep} batch {k:,} loss/word {float(loss.detach()) / max(float(gold.ne(Constants.PAD).sum()), 1):.4f}")
++        if (time.time() - t0) / 3600 > BUDGET: break
++    sc = val_score(); v = sum(sc.values()); hist.append(dict(epoch=ep, train_loss=tot / max(nw, 1), **sc))
++    log(f"epoch {ep} train loss {tot / max(nw, 1):.4f} val {sc}")
++    if v > best: best, bad = v, 0; torch.save(model.state_dict(), ck)
++    else: bad += 1
++    if bad >= 5 or (time.time() - t0) / 3600 > BUDGET: break
++model.load_state_dict(torch.load(ck)); model.eval(); train_hours = (time.time() - t0) / 3600
++
++fl = pd.read_parquet(FL).sort_values("event_row").reset_index(drop=True)
++erow = con.execute(f"""SELECT cascade_id, "position" FROM read_parquet('{B}/events.parquet') ORDER BY t, cascade_id, "position" """).fetchnumpy()
++qc, qp = erow["cascade_id"][fl.event_row.values], erow["position"][fl.event_row.values]
++R = np.zeros(len(fl)); QB = 32; t1 = time.time()
++with torch.no_grad():
++    for b0 in range(0, len(fl), QB):
++        idx = list(range(b0, min(b0 + QB, len(fl))))
++        L = 200; T = np.zeros((len(idx), L), np.int64); TS = np.zeros((len(idx), L), np.int64); pos_out = []
++        for r, i in enumerate(idx):
++            s0 = cstart[qc[i]]; a = max(0, qp[i] - (L - 1)); seq = users[s0 + a:s0 + qp[i] + 1]; tt = tsec[s0 + a:s0 + qp[i] + 1]
++            T[r, :len(seq)] = seq; TS[r, :len(seq)] = tt; pos_out.append(len(seq) - 2)
++        pred = model(torch.from_numpy(T).to(dev), torch.from_numpy(TS).to(dev), torch.from_numpy(qc[idx].astype(np.int64)).to(dev), graph, hyper)
++        pred = pred.view(len(idx), L - 1, user_size)
++        for r, i in enumerate(idx):
++            s0 = cstart[qc[i]]; j = s0 + qp[i]; y = int(ev["participant_id"][j]); tq = int(ev["t"][j])
++            lg = pred[r, pos_out[r], 2:]                                    # scores for participant ids 0..N-1
++            cand = elig & (first < tq); cand[torch.from_numpy(ev["participant_id"][s0:j].astype(np.int64)).to(dev)] = False; cand[y] = True
++            v = lg[y]; sc = lg[cand]; R[i] = 1 + float((sc > v).sum()) + 0.5 * (float((sc == v).sum()) - 1)
++        if b0 % (QB * 250) == 0: log(f"eval {b0:,}/{len(fl):,} ({time.time() - t1:.0f} s)")
++out = fl[["event_row", "cascade_id", "participant_id", "t", "split", "position", "in_all_sample", "in_novel_sample", "novel", "n_candidates"]].copy()
++out["rank_b2"] = R; out.to_parquet(f"{OUT}/b2_seed{SEED}.parquet", index=False)
++json.dump(dict(seed=SEED, hist=hist, train_hours=train_hours, budget_h=BUDGET, social_edges=int(len(eg["src"])), val_start=val_start),
++          open(f"{OUT}/b2_seed{SEED}.json", "w"), indent=1)
++log("DONE")
+
+--- a/PORT_CHANGES.md
++++ b/PORT_CHANGES.md
+@@ -0,0 +1,6 @@
++# MS-HGAT sparse port: changes from the released code (slingling/MS-HGAT; leak-free variant)
++
++1. **Sparse hypergraph layer** (`sparse_ops.py`): an exact identity replaces the dense row-softmax over the binary incidence matrix. `test_equiv.py` checks it against the released code on Twitter: incidence slices are identical and outputs agree to a relative 6e-8.
++2. **Duplicate (user, cascade) entries:** their times are summed before slicing, as the released `to_dense()` does. Benchmark tables have no duplicates.
++3. **Previous-user mask built on the GPU** (`HGAT.py`). Same function, same values; the released code built it on the CPU.
++4. **Model selection on validation** (`mshgat_bench.py`). The released `run.py` selected on test.
+
+--- a/run.py
++++ b/run.py
+@@ -105,7 +105,11 @@
+     test_data = DataLoader(test, batch_size=opt.batch_size, load_dict=True, cuda=False)
+     
+     relation_graph = ConRelationGraph(data_path)
+-    hypergraph_list = ConHyperGraphList(total_cascades, timestamps, user_size)
++    # LEAK-FREE VARIANT: only training cascades enter the diffusion hypergraphs (validation/test cascades blanked)
++    train_set = set(train[2])
++    hc = [c if i in train_set else [Constants.EOS] for i, c in enumerate(total_cascades)]
++    ht = [t if i in train_set else [Constants.EOS] for i, t in enumerate(timestamps)]
++    hypergraph_list = ConHyperGraphList(hc, ht, user_size)
+ 
+     opt.user_size = user_size
+ 
+
+--- a/sparse_ops.py
++++ b/sparse_ops.py
+@@ -0,0 +1,87 @@
++"""Exact sparse port of the MS-HGAT hypergraph layer and hypergraph construction (memory O(nnz) instead of O(users x cascades)).
++
++The released HGATLayer applies F.softmax to rows of a DENSE binary incidence matrix A (R x C). For a binary row with k ones,
++softmax gives weight e/(k e + C - k) to members and 1/(k e + C - k) to non-members, so
++
++    softmax(A, dim=1) @ X  =  (1^T X + (e - 1) A X) / (C + (e - 1) k)        (row-wise),
++
++which is computed here with a sparse A. This is an identity, not an approximation; test_equiv.py checks it against the
++released dense code. Consequence of the released design: every non-member receives nonzero weight, so for large C the
++aggregation approaches the global mean of X.
++"""
++import math
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from torch.nn.parameter import Parameter
++
++E1 = math.e - 1.0
++
++
++def soft_rowmix(A, X):
++    """softmax(dense(A), dim=1) @ X for a sparse binary A [R, C] and dense X [C, d]."""
++    C = A.shape[1]
++    k = torch.sparse.sum(A, 1).to_dense() if A._nnz() else torch.zeros(A.shape[0], device=X.device)
++    AX = torch.sparse.mm(A, X)
++    return (X.sum(0, keepdim=True) + E1 * AX) / (C + E1 * k).unsqueeze(1)
++
++
++class SparseHGATLayer(nn.Module):
++    """Same parameters and forward as layer.HGATLayer, with adj a sparse binary COO tensor [users, hyperedges]."""
++
++    def __init__(self, in_features, out_features, dropout, transfer, concat=True, bias=False, edge=True):
++        super().__init__()
++        self.dropout, self.in_features, self.out_features, self.concat, self.edge, self.transfer = dropout, in_features, out_features, concat, edge, transfer
++        if self.transfer: self.weight = Parameter(torch.Tensor(in_features, out_features))
++        else: self.register_parameter("weight", None)
++        self.weight2 = Parameter(torch.Tensor(in_features, out_features))
++        self.weight3 = Parameter(torch.Tensor(out_features, out_features))
++        if bias: self.bias = Parameter(torch.Tensor(out_features))
++        else: self.register_parameter("bias", None)
++        self.reset_parameters()
++
++    def reset_parameters(self):
++        stdv = 1. / math.sqrt(self.out_features)
++        if self.weight is not None: self.weight.data.uniform_(-stdv, stdv)
++        self.weight2.data.uniform_(-stdv, stdv); self.weight3.data.uniform_(-stdv, stdv)
++        if self.bias is not None: self.bias.data.uniform_(-stdv, stdv)
++
++    def forward(self, x, adj, root_emb):
++        x = x.matmul(self.weight) if self.transfer else x.matmul(self.weight2)
++        if self.bias is not None: x = x + self.bias
++        adjT = adj.t().coalesce()
++        edge = soft_rowmix(adjT, x)                                   # = softmax(adj.T, 1) @ x
++        edge = F.relu(F.dropout(edge, self.dropout, training=self.training))
++        e1 = edge.matmul(self.weight3)
++        node = F.dropout(soft_rowmix(adj, e1), self.dropout, training=self.training)   # = softmax(adj, 1) @ e1
++        if self.concat: node = F.relu(node)
++        if self.edge:
++            edge = F.relu(F.dropout(soft_rowmix(adjT, node), self.dropout, training=self.training))
++            return node, edge
++        return node
++
++
++def ConHyperGraphListSparse(cascades, timestamps, user_size, step_split=8):
++    """Same slices as graphConstruct.ConHyperGraphList, returned as sparse binary COO tensors [user_size, n_cascades + 1]."""
++    rows, cols, vals, root_list = [], [], [], [0]
++    for i, (c, t) in enumerate(zip(cascades, timestamps)):
++        root_list.append(c[0]); rows += c[:-1]; cols += [i + 1] * (len(c) - 1); vals += t[:-1]
++    E = len(cascades) + 1
++    # The released code builds a dense matrix with to_dense(), which SUMS the times of duplicate (user, cascade) entries;
++    # a summed time then falls outside every slice. Reproduced exactly: coalesce (sum) duplicates before slicing.
++    # Benchmark tables hold first participations only, so duplicates cannot occur there.
++    T = torch.sparse_coo_tensor(torch.tensor([rows, cols]), torch.tensor(vals, dtype=torch.float32), [user_size, E]).coalesce()
++    rows, cols, vals = T.indices()[0], T.indices()[1], T.values()
++    time_sorted = []
++    for t in timestamps: time_sorted += t[:-1]
++    time_sorted = sorted(time_sorted); L = len(time_sorted) // step_split
++    vt = vals.float()   # the released code compares float32 times (torch.Tensor), reproduced here
++    graph_list = {}
++    for x in range(L, L * step_split, L):
++        hi = torch.tensor(time_sorted[x], dtype=torch.float32)
++        lo = torch.tensor(0.0) if x == L else torch.tensor(time_sorted[x - L], dtype=torch.float32)
++        m = (vt > lo) & (vt <= hi)
++        idx = torch.stack([rows[m], cols[m]])
++        A = torch.sparse_coo_tensor(idx, torch.ones(int(m.sum())), [user_size, E]).coalesce()
++        graph_list[time_sorted[x]] = A
++    return [graph_list, torch.tensor(root_list)]
+
+--- a/test_equiv.py
++++ b/test_equiv.py
+@@ -0,0 +1,25 @@
++"""Numerical equivalence of the sparse MS-HGAT port and the released dense code (legacy Twitter, train-only hypergraphs)."""
++import importlib, os, sys
++import numpy as np, torch
++sys.argv = [sys.argv[0], "-data_name", "twitter"]
++import Constants
++from dataLoader import Split_data, DataLoader
++from graphConstruct import ConHyperGraphList, ConRelationGraph
++from sparse_ops import ConHyperGraphListSparse
++import HGAT as H
++
++class O: pass
++opt = O(); opt.d_word_vec = opt.d_model = 64; opt.initialFeatureSize = 64
++user_size, cas, ts, train, valid, test = Split_data("twitter", 0.8, 0.1, load_dict=True); opt.user_size = user_size
++tr = set(train[2]); hc = [c if i in tr else [Constants.EOS] for i, c in enumerate(cas)]; ht = [t if i in tr else [Constants.EOS] for i, t in enumerate(ts)]
++dense = ConHyperGraphList(hc, ht, user_size); sparse = ConHyperGraphListSparse(hc, ht, user_size)
++print("slice keys equal:", list(dense[0].keys()) == list(sparse[0].keys()))
++print("incidence equal per slice:", all(torch.equal(dense[0][k].float(), sparse[0][k].to_dense().float()) for k in dense[0]))
++graph = ConRelationGraph("twitter")
++torch.manual_seed(0); H.SPARSE = False; md = H.MSHGAT(opt, dropout=0.3).cuda().eval()
++H.SPARSE = True; ms = H.MSHGAT(opt, dropout=0.3).cuda().eval(); ms.load_state_dict(md.state_dict())
++batch = next(iter(DataLoader(test, batch_size=32, cuda=False)))
++with torch.no_grad():
++    yd = md(*[b.cuda() for b in batch], graph, dense); ys = ms(*[b.cuda() for b in batch], graph, sparse)
++d = (yd - ys).abs(); print(f"MSHGAT output max |diff| {float(d.max()):.3e}, rel {float(d.max() / yd.abs().max()):.3e}")
++print("top-100 identical for", float((yd.topk(100).indices == ys.topk(100).indices).float().mean()), "of positions")

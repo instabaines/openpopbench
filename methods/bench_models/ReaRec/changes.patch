@@ -1,0 +1,12 @@
+diff --git a/src/models/PRL.py b/src/models/PRL.py
+index 72d4ef2..41b6f47 100644
+--- a/src/models/PRL.py
++++ b/src/models/PRL.py
+@@ -201,6 +201,7 @@ class PRL(SequentialModel):
+         )
+ 
+         # thinking contrastive loss
++        cl_loss = 0.0  # BENCH fix: undefined when no second view exists (warm-up epochs, noise_factor 0), which crashed epoch 0
+         if repeat_times > 1 and self.cl_weight > 0:
+             view1_embs = out_dict["model_output"][:batch_size, 1:, :]
+             view2_embs = out_dict["model_output"][batch_size:, 1:, :]

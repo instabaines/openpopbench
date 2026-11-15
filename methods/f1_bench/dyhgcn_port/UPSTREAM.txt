@@ -1,0 +1,3 @@
+path	f1_bench/dyhgcn_port
+url	https://github.com/chunyuanY/DyHGCN.git
+commit	54cd2c6f1cbf9afe862f6cc450a75f2bfd092f1d
