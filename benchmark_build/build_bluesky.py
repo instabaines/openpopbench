@@ -19,6 +19,7 @@ import duckdb
 
 RAW = os.environ["BLUESKY_RAW"]
 OUT = os.environ["BLUESKY_OUT"]
+ID_PERM = os.environ.get("ID_PERM")   # released bluesky_id_perm.parquet: reproduces our participant ids without DuckDB's hash() (2026-11-20)
 H = 72 * 3600
 D = lambda s: int(duckdb.sql(f"SELECT epoch(TIMESTAMPTZ '{s} 00:00:00+00')").fetchone()[0])
 W = dict(train=(D("2025-03-03"), D("2025-03-28")), val=(D("2025-03-31"), D("2025-04-04")), test=(D("2025-04-07"), D("2025-04-11")))
@@ -57,7 +58,13 @@ X(f"""CREATE OR REPLACE TABLE first_part AS SELECT did_id c, min(epoch(created_a
       WHERE created_at >= to_timestamp({T_MIN}) AND created_at < to_timestamp({T_END}) GROUP BY 1""")
 X(f"""CREATE OR REPLACE TABLE first_post AS SELECT did_id c, min(epoch(created_at))::BIGINT t FROM read_parquet('{RAW}/posts.parquet')
       WHERE created_at >= to_timestamp({T_MIN}) AND created_at < to_timestamp({T_END}) GROUP BY 1""")
-X("""CREATE OR REPLACE TABLE idm AS WITH u AS (SELECT c FROM first_part UNION SELECT c FROM first_post)
+if ID_PERM:   # canonical order (ascending did_id), then the released permutation to our ids (bluesky_id_perm.py)
+    X(f"""CREATE OR REPLACE TABLE idm AS WITH u AS (SELECT c FROM first_part UNION SELECT c FROM first_post),
+          r AS (SELECT c, row_number() OVER (ORDER BY c) - 1 rk FROM u)
+          SELECT r.c did_id, p.participant_id::BIGINT participant_id FROM r JOIN read_parquet('{ID_PERM}') p ON p.canonical_rank = r.rk""")
+    assert X("SELECT count(*) FROM idm").fetchone()[0] == X("SELECT count(*) FROM (SELECT c FROM first_part UNION SELECT c FROM first_post)").fetchone()[0]
+else:
+    X("""CREATE OR REPLACE TABLE idm AS WITH u AS (SELECT c FROM first_part UNION SELECT c FROM first_post)
       SELECT c did_id, row_number() OVER (ORDER BY hash(c), c) - 1 participant_id FROM u""")
 X("""CREATE OR REPLACE TABLE part AS
       SELECT i.participant_id, i.did_id, fp.t first_part_t, fo.t first_post_t, least(fp.t, fo.t) first_seen_t,

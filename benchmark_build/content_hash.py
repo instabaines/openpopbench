@@ -19,6 +19,9 @@ import pyarrow.parquet as pq
 def content_hash(path):
     t = pq.read_table(path)
     t = t.select(sorted(t.column_names))
+    # 64-bit string offsets: tables over ~2^31 bytes of string data (Bluesky L edges) overflow the 32-bit type when sorted.
+    # The hash covers names, validity and values only, so the change does not alter any hash (2026-11-20).
+    t = t.cast(pa.schema([pa.field(f.name, pa.large_string() if pa.types.is_string(f.type) else f.type) for f in t.schema]))
     t = t.sort_by([(c, "ascending") for c in t.column_names]) if t.num_rows else t
     h = hashlib.sha256()
     for name in t.column_names:
@@ -30,7 +33,7 @@ def content_hash(path):
             v = np.asarray(pc.fill_null(col.cast(pa.int64()), 0).to_numpy(zero_copy_only=False), np.int64)
         elif pa.types.is_floating(ty): v = np.asarray(pc.fill_null(col.cast(pa.float64()), 0.0).to_numpy(zero_copy_only=False), np.float64)
         elif pa.types.is_string(ty) or pa.types.is_large_string(ty) or pa.types.is_dictionary(ty):
-            s = pc.fill_null(col.cast(pa.string()), ""); u = pc.unique(s); u = u.take(pc.sort_indices(u))   # sorted distinct values
+            s = pc.fill_null(col.cast(pa.large_string()), ""); u = pc.unique(s); u = u.take(pc.sort_indices(u))   # sorted distinct values
             h.update("\0".join(u.to_pylist()).encode() + b"\1")
             v = np.asarray(pc.index_in(s, value_set=u).to_numpy(zero_copy_only=False), np.int64)          # each row's index in them
         else: raise TypeError(f"{path}: column {name} has unsupported type {ty}")

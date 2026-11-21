@@ -1,4 +1,4 @@
-# Datasheet: OpenPopBench Bluesky (v1.0)
+# Datasheet: OpenPopBench Bluesky (v1.0, released as a rebuild package)
 
 Format: Gebru et al., *Datasheets for Datasets* (CACM 2021). Numbers from the paper (Table 1 and Appendix A).
 
@@ -61,9 +61,15 @@ Format: Gebru et al., *Datasheets for Datasets* (CACM 2021). Numbers from the pa
 
 ## Distribution
 
-- **Where.** A Hugging Face dataset with gated download: a click-through agreement with automatic approval that permits research use only and prohibits re-identification and linkage to the live network. Each version has a DOI.
+- **v1.0: rebuild package (no tables).** Until the export's authors confirm its redistribution terms, no Bluesky tables are hosted. A Hugging Face dataset (with a DOI) holds:
+  - a permutation of integers that fixes account numbering (`bluesky_id_perm.parquet`);
+  - the accounts of each sampled tier (`tier_{S,Mid,M}_members.parquet`);
+  - checksums of the three source files and content hashes of every table and query file;
+  - `tiers.json`.
+
+  With a copy of the source export, `scripts/bluesky/rebuild.sh` in the code repository rebuilds the exact tables, query files and Task 2 flags.
+- **Later: hosted tables.** Once the terms are confirmed, the tables will be hosted with gated download: a click-through agreement with automatic approval that permits research use only and prohibits re-identification and linkage to the live network.
 - **Terms.** The terms of the source export, which ask users to cite Balduf et al. (IMC 2024). Cite the OpenPopBench paper as well.
-- **Includes.** Tables for the four tiers, query files, Task 2 flags, tier-sampling seeds, content checksums, and Croissant metadata.
 
 ## Maintenance
 

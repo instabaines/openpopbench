@@ -11,6 +11,9 @@ is snapshotted at 50k accounts (S) and continues to 500k (M), so S is nested in 
 Restriction: a cascade is kept when its origin is sampled; its events are restricted to sampled accounts; cascades left
 with no non-origin event are dropped. Ids are re-densified; l_participant_id and l_cascade_id link back to L.
 Tier membership uses the whole-period graph (as legacy datasets do); features inside a tier still obey the time rules.
+FF_CUT=<unix time> (env, added 2026-11-20 for the AI-review tier audit): the fire runs only on edges created before the cut
+and seeds only from accounts active before it, so membership uses no information from on or after the cut. The tier's
+tables (events, edges) are restricted exactly as without the cut. Unset: unchanged behaviour.
 """
 import json
 import os
@@ -34,18 +37,26 @@ for t in ("events", "cascades", "participants", "edges"):
     con.execute(f"CREATE VIEW {t} AS SELECT * FROM read_parquet('{BL}/{t}.parquet')")
 N = con.execute("SELECT count(*) FROM participants").fetchone()[0]
 
-log("undirected adjacency")
-adj = con.execute("SELECT u, v FROM (SELECT src u, dst v FROM edges UNION ALL SELECT dst, src FROM edges) ORDER BY u, v").fetchnumpy()
+CUT = os.environ.get("FF_CUT")
+EW = f"WHERE t_created < {int(CUT)}" if CUT else ""
+log(f"undirected adjacency (cut: {CUT})")
+adj = con.execute(f"SELECT u, v FROM (SELECT src u, dst v FROM edges {EW} UNION ALL SELECT dst, src FROM edges {EW}) ORDER BY u, v").fetchnumpy()
 rowptr = np.searchsorted(adj["u"], np.arange(N + 1)); nbr = adj["v"].astype(np.int32); del adj
-active = np.unique(con.execute("SELECT DISTINCT participant_id FROM events").fetchnumpy()["participant_id"])
+active = np.unique(con.execute(f"SELECT DISTINCT participant_id FROM events {'WHERE t < ' + str(int(CUT)) if CUT else ''}").fetchnumpy()["participant_id"])
 log(f"{N:,} participants, {len(active):,} active, {len(nbr):,} adjacency entries")
 
+MEMBERS = os.environ.get("MEMBERS")   # NAME=FILE (2026-11-20): take the tier's accounts from a released membership file
+# (column l_participant_id) instead of running the fire; used to rebuild tiers drawn by an earlier sampler version.
 RUNS = [(pf, sd) for pf in PFS for sd in SEEDS]
 for PF, SEED in RUNS:
     ROOT = OUT if len(RUNS) == 1 else f"{OUT}/pf{PF}_s{SEED}"
     log("forest fire")
     rng = np.random.default_rng(SEED)
     visited = np.zeros(N, bool); count = 0; queue = deque(); snaps = {}; reignite = 0
+    if MEMBERS:
+        mname, mfile = MEMBERS.split("=", 1)
+        ids = np.sort(con.execute(f"SELECT l_participant_id FROM read_parquet('{mfile}')").fetchnumpy()["l_participant_id"].astype(np.int64))
+        snaps[mname] = (ids, 0); TARGETS = [(mname, len(ids))]; log(f"{mname}: {len(ids):,} accounts from {mfile}")
     while len(snaps) < len(TARGETS):
         if not queue:
             while True:
@@ -97,7 +108,7 @@ for PF, SEED in RUNS:
         (ne,), = con.execute(f"SELECT count(*) FROM read_parquet('{D}/edges.parquet')").fetchall()
         (act,), = con.execute(f"SELECT count(DISTINCT participant_id) FROM read_parquet('{D}/events.parquet')").fetchall()
         meta = json.load(open(f"{BL}/splits.json"))
-        info = dict(tier=name, sampler=dict(method="forest fire, undirected", p_f=PF, seed=SEED, ignitions=int(ign), source=BL),
+        info = dict(tier=name, sampler=dict(method="forest fire, undirected", p_f=PF, seed=SEED, ignitions=int(ign), source=BL, membership_cut=int(CUT) if CUT else None),
                     accounts=int(len(ids)), accounts_with_events=int(act), cascades=int(st[0]), events=int(st[1]),
                     events_per_account=float(st[1] / len(ids)), train_events_per_account=float(st[4] / len(ids)),
                     retained_share_median=float(st[2]), retained_share_mean=float(st[3]), cascades_by_split=dict(train=st[5], val=st[6], test=st[7]),
